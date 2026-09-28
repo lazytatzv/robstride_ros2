@@ -45,6 +45,13 @@ install(TARGETS ${PROJECT_NAME}
 install(DIRECTORY include/ DESTINATION include)
 install(FILES README.md CHANGELOG.rst LICENSE DESTINATION share/${PROJECT_NAME})
 
+add_executable(motor_test_node src/motor_test.cpp)
+target_link_libraries(motor_test_node 
+  PRIVATE
+  ${PROJECT_NAME}
+)
+install(TARGETS motor_test_node DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_driver_configuration test/test_driver_configuration.cpp)
@@ -71,6 +78,7 @@ if(BUILD_TESTING)
     target_link_libraries(test_vcan_transport_integration robstride_vcan_test_support)
     add_executable(test_vcan_fake_motor_integration test/test_vcan_fake_motor_integration.cpp)
     target_link_libraries(test_vcan_fake_motor_integration robstride_vcan_test_support)
+
   endif()
 endif()
 
