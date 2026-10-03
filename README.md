@@ -242,7 +242,12 @@ Position control activation requires recent, finite position feedback inside
 the mode switch; a rejected switch leaves the previous mode unchanged. The
 initial position target is the latest measured position, not a limit boundary.
 The feedback must be newer than `feedback_timeout_ms` even if
-`fail_on_feedback_timeout` is disabled.
+`fail_on_feedback_timeout` is disabled. Position transforms use the same strict
+joint-coordinate boundary checks during configuration, mode activation and
+command submission. A forward-transform boundary overshoot may be snapped to
+the motor endpoint only within eight adjacent `double` values; transforms that
+need a larger correction or collapse the joint range are rejected. This does
+not widen operational command limits or accept an adjacent outside joint value.
 Once active, a position, velocity, or effort command outside its `command_*`
 range (or the transformed motor range) is rejected, never clamped. The entire
 multi-joint CAN command batch is withheld, queued motion commands are cleared,
@@ -373,6 +378,25 @@ Diagnostic levels have the following meaning:
 | `WARN` | No feedback yet, Run-mode recovery is active, or an active motor is outside Run mode | Endpoint loss is still within its grace period, or hardware is inactive |
 | `ERROR` | Feedback is stale or a motor fault flag is set | A persistent transport failure affects active hardware |
 
+Exceptions from receive callbacks, diagnostic providers/publication, and executor
+work are contained at the transport thread boundary. A failure latches
+`executor failed` health, disables active commands, wakes transaction waiters,
+and makes active hardware reads and writes return `ERROR`. A one-shot transport
+`ERROR` diagnostic is attempted without invoking the metrics provider; if ROS
+publication is unavailable, health remains latched and stderr reports the failure.
+Expected ROS context shutdown reports `ROS context shutdown` health and stops
+transport service without reporting an executor exception (active hardware still
+returns `ERROR` because service is unavailable). Transmit-thread exceptions likewise stop service, including
+failures during worker setup before its first publication.
+
+Lifecycle start/stop must be called serially by the owning thread, never from a
+transport callback. Stop joins both threads before releasing ROS resources;
+restart reaps any failed run before creating new threads. The executor uses a
+finite idle wait rather than depending on cancellation during ROS shutdown.
+This does not bound a callback or publisher that blocks indefinitely: stop still
+waits for in-flight work, and no thread is detached. Transport failure cannot
+guarantee that motor stop commands reach the CAN bridge.
+
 The six fault flags in the normal motor feedback are decoded as undervoltage,
 overcurrent, over-temperature, encoder fault, stall overload, and encoder
 uncalibrated. The `fault_flags_raw` field remains available for firmware-level
@@ -446,8 +470,23 @@ CI additionally exercises both directions of the topic transport through
 `ros2_socketcan` and a Linux `vcan` interface. A simulated RobStride motor on
 that bus verifies startup parameter confirmation, enable and motion feedback,
 automatic Run-mode recovery, feedback timeout handling, and shutdown when stop
-confirmation is missing. These tests do not replace hardware-in-the-loop
-testing of timing or physical motor behavior.
+confirmation is missing. The fake keeps explicitly injected measured position
+separate from captured commands: it does not model motion or teleport the shaft
+when a zero-gain startup command arrives. Tests include startup outside operational
+position limits and successful command activation after measured position returns
+inside those limits.
+
+The fake simulates the configured CAN watchdog using a monotonic clock and
+50-microsecond ticks (20,000 ticks/second). Enable starts the deadline; addressed
+motion commands refresh it. Parameter reads and traffic addressed to other motor
+IDs do not. Expiry changes the fake to Reset and emits feedback if enabled.
+Two-motor scenarios independently drop one motor's commands or feedback, verify
+per-ID recovery routing, and check both settings of `fail_on_feedback_timeout`.
+Polling has bounded deadlines; driver and worker-thread cleanup is RAII-managed,
+including failed assertions. These software simulations are not hardware-in-the-loop
+tests, a firmware-conformance claim, or evidence of physical safety. Real watchdog
+timing, bus failures, motor dynamics, and safe mechanical behavior require hardware
+validation.
 
 ## License
 

@@ -180,6 +180,7 @@ void RobStrideDriver::stop() noexcept
 bool RobStrideDriver::update_state()
 {
   if (!active_) {return true;}
+  if (!check_transport_health()) {return false;}
   const auto now = std::chrono::steady_clock::now();
   bool read_failed = false;
   runtime_events_.clear();
@@ -282,16 +283,15 @@ bool RobStrideDriver::send_commands()
         break;
       }
       // An unclaimed position interface has no position target; kp=0 makes this neutral.
-      const double motor_position = joint.claimed.position ?
-        joint.direction * (joint.command.position - joint.position_offset) * joint.gear_ratio :
-        0.0;
+      const auto checked_position = joint.claimed.position ?
+        joint.checked_joint_to_motor_position(joint.command.position) : std::optional<double>{0.0};
+      const double motor_position = checked_position.value_or(
+        std::numeric_limits<double>::quiet_NaN());
       const double motor_velocity =
         joint.claimed.velocity ? joint.direction * joint.command.velocity * joint.gear_ratio : 0.0;
       const double motor_effort =
         joint.claimed.effort ? joint.joint_to_motor_effort(joint.command.effort) : 0.0;
-      if (joint.claimed.position &&
-        (!std::isfinite(motor_position) || motor_position < joint.limits.position_min ||
-        motor_position > joint.limits.position_max))
+      if (!checked_position)
       {
         reject("motor position", motor_position, joint.limits.position_min,
           joint.limits.position_max);
@@ -347,6 +347,10 @@ bool RobStrideDriver::check_transport_health()
     condition = "CAN bridge transmit endpoint is unavailable";
   } else if (health.state == CanTransportHealthState::transmit_stalled) {
     condition = "CAN transmit worker is not making progress";
+  } else if (health.state == CanTransportHealthState::context_shutdown) {
+    condition = "CAN transport ROS context shut down";
+  } else if (health.state == CanTransportHealthState::executor_failed) {
+    condition = "CAN receive/diagnostic executor failed";
   } else if (health.state == CanTransportHealthState::worker_stopped) {
     condition = "CAN transmit worker stopped unexpectedly";
   }
@@ -414,10 +418,7 @@ bool RobStrideDriver::validate_command_modes_locked(
       }
       return false;
     }
-    const double motor_position =
-      joint.direction * (position - joint.position_offset) * joint.gear_ratio;
-    if (!std::isfinite(motor_position) || motor_position < joint.limits.position_min ||
-      motor_position > joint.limits.position_max)
+    if (!joint.checked_joint_to_motor_position(position))
     {
       if (error) {*error = "Joint '" + joint.name + "': measured position exceeds motor range";}
       return false;
