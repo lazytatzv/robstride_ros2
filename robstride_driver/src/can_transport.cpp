@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace robstride_driver
@@ -359,6 +360,7 @@ bool CanTransport::publish_unlocked(const Frame & source)
   message.dlc = 8;
   message.data = source.data;
   publisher_->publish(message);
+  std::this_thread::sleep_for(std::chrono::microseconds(1200));
   return true;
 }
 

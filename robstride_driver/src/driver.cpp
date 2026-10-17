@@ -137,15 +137,43 @@ bool RobStrideDriver::start()
   for (auto & joint : joints_) {
     if (settings_.clear_faults_on_start) {
       transport_->send_transaction(make_stop(joint.can_id, settings_.host_id, true));
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (!write_and_confirm_parameter(joint, kIndexCanTimeout, joint.can_timeout_ticks) ||
+    if (!write_and_confirm_parameter(joint, kIndexCanTimeout, 0) ||
       !write_and_confirm_parameter(joint, kIndexRunMode, 0))
     {
       disable_all();
       return false;
     }
     if (settings_.set_zero_on_start) {
-      transport_->send_transaction(make_set_zero(joint.can_id, settings_.host_id));
+      bool zero_confirmed = false;
+      for (int attempt = 1; attempt <= settings_.startup_retries; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        const auto requested_at = std::chrono::steady_clock::now();
+        transport_->send_transaction(make_set_zero(joint.can_id, settings_.host_id));
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        transport_->send_transaction(make_stop(joint.can_id, settings_.host_id, false));
+
+        std::unique_lock<std::mutex> lock(state_mutex_);
+        zero_confirmed = feedback_condition_.wait_for(
+          lock, settings_.startup_confirmation_timeout,
+          [&joint, requested_at]() {
+            return joint.feedback_status.received &&
+                   joint.feedback_status.timestamp >= requested_at &&
+                   std::abs(joint.feedback.position - joint.position_offset) < 0.1;
+          });
+        if (zero_confirmed) {
+          RCLCPP_INFO(
+            logger_, "Joint '%s' (CAN ID %u): zero position confirmed (pos=%.4f rad)",
+            joint.name.c_str(), joint.can_id, joint.feedback.position);
+          break;
+        }
+        RCLCPP_WARN(
+          logger_,
+          "Joint '%s' (CAN ID %u): set_zero attempt %d/%d not yet zero (pos=%.4f rad)",
+          joint.name.c_str(), joint.can_id, attempt, settings_.startup_retries,
+          joint.feedback.position);
+      }
     }
   }
 
@@ -263,8 +291,7 @@ bool RobStrideDriver::send_commands()
             std::to_string(value) + " is outside [" + std::to_string(minimum) + ", " +
             std::to_string(maximum) + "]";
         };
-      if (joint.claimed.position &&
-        !joint.command_limits.contains_position(joint.command.position))
+      if (joint.claimed.position && !std::isfinite(joint.command.position))
       {
         reject("position", joint.command.position, joint.command_limits.position_min,
           joint.command_limits.position_max);
@@ -282,9 +309,13 @@ bool RobStrideDriver::send_commands()
           joint.command_limits.effort_max);
         break;
       }
+      const double clamped_joint_position = joint.claimed.position ?
+        std::clamp(
+          joint.command.position, joint.command_limits.position_min,
+          joint.command_limits.position_max) : 0.0;
       // An unclaimed position interface has no position target; kp=0 makes this neutral.
       const auto checked_position = joint.claimed.position ?
-        joint.checked_joint_to_motor_position(joint.command.position) : std::optional<double>{0.0};
+        joint.checked_joint_to_motor_position(clamped_joint_position) : std::optional<double>{0.0};
       const double motor_position = checked_position.value_or(
         std::numeric_limits<double>::quiet_NaN());
       const double motor_velocity =
@@ -580,6 +611,7 @@ bool RobStrideDriver::write_and_confirm_parameter(
   JointData & joint, uint16_t index, uint32_t value)
 {
   for (int attempt = 1; attempt <= settings_.startup_retries; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     const auto requested_at = std::chrono::steady_clock::now();
     if (index == kIndexRunMode) {
       transport_->send_transaction(
@@ -587,6 +619,7 @@ bool RobStrideDriver::write_and_confirm_parameter(
     } else {
       transport_->send_transaction(make_write_u32(joint.can_id, settings_.host_id, index, value));
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
     transport_->send_transaction(make_read_parameter(joint.can_id, settings_.host_id, index));
 
     std::unique_lock<std::mutex> lock(state_mutex_);
@@ -610,31 +643,40 @@ bool RobStrideDriver::write_and_confirm_parameter(
 
 bool RobStrideDriver::enable_and_confirm_all()
 {
-  for (int attempt = 1; attempt <= settings_.startup_retries; ++attempt) {
-    const auto requested_at = std::chrono::steady_clock::now();
-    for (const auto & joint : joints_) {
+  for (auto & joint : joints_) {
+    bool joint_confirmed = false;
+    for (int attempt = 1; attempt <= settings_.startup_retries; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (attempt > 1 || settings_.clear_faults_on_start) {
+        transport_->send_transaction(make_stop(joint.can_id, settings_.host_id, true));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      const auto requested_at = std::chrono::steady_clock::now();
       transport_->send_transaction(make_enable(joint.can_id, settings_.host_id));
-      transport_->send_transaction(make_motion_command(
-          joint.can_id, joint.limits, 0.0, 0.0, 0.0, 0.0, 0.0));
-    }
 
-    std::unique_lock<std::mutex> lock(state_mutex_);
-    const bool confirmed = feedback_condition_.wait_for(
-      lock, settings_.startup_confirmation_timeout,
-      [this, requested_at]() {
-        return std::all_of(joints_.begin(), joints_.end(), [requested_at](const JointData & joint) {
+      std::unique_lock<std::mutex> lock(state_mutex_);
+      joint_confirmed = feedback_condition_.wait_for(
+        lock, settings_.startup_confirmation_timeout,
+        [&joint, requested_at]() {
           return joint.feedback_status.received &&
                  joint.feedback_status.timestamp >= requested_at &&
                  joint.feedback_status.mode == kMotorModeRun;
         });
-      });
-    if (confirmed) {return true;}
-    RCLCPP_WARN(
-      logger_, "Motor enable confirmation attempt %d/%d failed",
-      attempt, settings_.startup_retries);
+      if (joint_confirmed) {break;}
+      RCLCPP_WARN(
+        logger_,
+        "Joint '%s' (CAN ID %u): enable confirmation attempt %d/%d failed (received=%d, mode=%u, fault=0x%02X)",
+        joint.name.c_str(), joint.can_id, attempt, settings_.startup_retries,
+        static_cast<int>(joint.feedback_status.received),
+        static_cast<unsigned int>(joint.feedback_status.mode),
+        static_cast<unsigned int>(joint.feedback.fault));
+    }
+    if (!joint_confirmed) {
+      RCLCPP_ERROR(logger_, "Not all motors entered Run mode");
+      return false;
+    }
   }
-  RCLCPP_ERROR(logger_, "Not all motors entered Run mode");
-  return false;
+  return true;
 }
 
 void RobStrideDriver::disable_all()
@@ -651,7 +693,9 @@ void RobStrideDriver::disable_all()
     for (const auto & joint : joints_) {
       transport_->send_transaction(
         make_motion_command(joint.can_id, joint.limits, 0.0, 0.0, 0.0, 0.0, 0.0));
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
       transport_->send_transaction(make_stop(joint.can_id, settings_.host_id));
+      std::this_thread::sleep_for(std::chrono::milliseconds(3));
     }
     stop_frames_acknowledged =
       transport_->wait_for_transaction_acknowledgements(std::chrono::milliseconds(50));
