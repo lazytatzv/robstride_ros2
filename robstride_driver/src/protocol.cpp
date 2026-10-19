@@ -118,7 +118,7 @@ std::optional<Feedback> decode_feedback(
   uint8_t expected_host_id, const Limits & limits)
 {
   if (!is_extended || dlc != 8 || ((id >> 24) & 0x1f) != kTypeFeedback ||
-    (id & 0xff) != expected_host_id)
+    (expected_host_id != 0 && (id & 0xff) != expected_host_id))
   {
     return std::nullopt;
   }

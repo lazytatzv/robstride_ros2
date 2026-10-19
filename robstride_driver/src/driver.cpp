@@ -554,10 +554,20 @@ void RobStrideDriver::receive_frame(can_msgs::msg::Frame::ConstSharedPtr msg)
     return;
   }
 
-  const auto decoded = decode_feedback(
+  auto decoded = decode_feedback(
     msg->id, msg->data, msg->dlc, msg->is_extended, settings_.host_id,
     joints_[joint_entry->second].limits);
-  if (!decoded) {return;}
+  if (!decoded) {
+    // If feedback arrived with mismatched host_id, decode anyway and re-assert host_id via enable
+    decoded = decode_feedback(
+      msg->id, msg->data, msg->dlc, msg->is_extended, 0,
+      joints_[joint_entry->second].limits);
+    if (decoded) {
+      transport_->send_transaction(make_enable(motor_id, settings_.host_id));
+    } else {
+      return;
+    }
+  }
   const auto received_at = std::chrono::steady_clock::now();
   ++feedback_frames_received_;
   record_feedback(joint_entry->second, received_at, *decoded);
